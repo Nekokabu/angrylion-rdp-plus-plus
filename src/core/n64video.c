@@ -131,11 +131,18 @@ static uint32_t rdp_cmd_len;
 // multithreaded mode
 static bool rdp_cmd_sync[64];
 
+// buffer entries that mark the end of the available commands (RDP idle)
+static bool rdp_cmd_idle[CMD_BUFFER_SIZE];
+
 static void cmd_run_buffered(uint32_t worker_id)
 {
     uint32_t pos;
     for (pos = 0; pos < rdp_cmd_buf_pos; pos++) {
-        rdp_cmd(&state[worker_id], rdp_cmd_buf[pos]);
+        if (rdp_cmd_idle[pos]) {
+            rdp_idle(&state[worker_id]);
+        } else {
+            rdp_cmd(&state[worker_id], rdp_cmd_buf[pos]);
+        }
     }
 
     // mailbox slots may be reused by the next batch
@@ -150,6 +157,30 @@ static void cmd_flush(void)
         parallel_run(cmd_run_buffered);
         // reset buffer by starting from the beginning
         rdp_cmd_buf_pos = 0;
+    }
+}
+
+// tell the workers that the RDP has run out of commands
+static void cmd_idle(void)
+{
+    if (!config.parallel) {
+        rdp_idle(&state[0]);
+        return;
+    }
+
+    // a partially received command still occupies the current entry
+    if (rdp_cmd_pos != 0) {
+        return;
+    }
+
+    // one marker is enough
+    if (rdp_cmd_buf_pos > 0 && rdp_cmd_idle[rdp_cmd_buf_pos - 1]) {
+        return;
+    }
+
+    rdp_cmd_idle[rdp_cmd_buf_pos++] = true;
+    if (rdp_cmd_buf_pos >= CMD_BUFFER_SIZE) {
+        cmd_flush();
     }
 }
 
@@ -292,13 +323,16 @@ void n64video_process_list(void)
             if (config.parallel) {
                 // special case: sync_full always needs to be run in main thread
                 if (rdp_cmd_id == CMD_ID_SYNC_FULL) {
-                    // first, run all pending commands
+                    // first, run all pending commands, including the queued
+                    // TMEM writes that the sync completes
+                    cmd_idle();
                     cmd_flush();
 
                     // parameters are unused, so NULL is fine
                     rdp_sync_full(NULL, NULL);
                 } else {
                     // increment buffer position
+                    rdp_cmd_idle[rdp_cmd_buf_pos] = false;
                     rdp_cmd_buf_pos++;
 
                     // flush buffer when it is full or when the current command requires a sync
@@ -320,6 +354,9 @@ void n64video_process_list(void)
             cmd_init();
         }
     }
+
+    // the RDP is now idle until more commands arrive
+    cmd_idle();
 
     // update DP registers to indicate that all bytes have been read
     *dp_reg[DP_START] = *dp_reg[DP_CURRENT] = *dp_reg[DP_END];

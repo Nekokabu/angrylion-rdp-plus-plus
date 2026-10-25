@@ -188,6 +188,9 @@ struct combiner_inputs
     int add_a1;
 };
 
+// TMEM writes of a load that are still pending when the next command arrives
+#define LOAD_QUEUE_DEPTH 15
+
 struct rdp_state
 {
     uint32_t stride;
@@ -349,6 +352,22 @@ struct rdp_state
     // tmem
     uint8_t tmem[0x1000];
 
+    // load queue: the last TMEM writes of a load that real hardware has not
+    // done yet when the next command arrives (see rdp/tex.c)
+    struct {
+        int32_t s, t;           // texture coordinates of the write
+        uint32_t offset;        // source byte offset from the load's ti_address
+        int8_t row;             // index into lq_row_*, or -1 for an idle slot
+    } lq_slot[LOAD_QUEUE_DEPTH];
+    int lq_count;               // slots queued
+    int lq_head;                // next slot to retire = slots retired so far
+    int lq_rows;
+    uint32_t lq_row_base[LOAD_QUEUE_DEPTH];   // source address the row is read from
+    int lq_row_latch[LOAD_QUEUE_DEPTH];       // last retired-slot count at which STI still changes the row
+    int lq_tilenum;
+    int lq_coord_quad;
+    int lq_ltlut;
+
     // zbuffer
     uint32_t zb_address;
     int32_t pastrawdzmem;
@@ -404,6 +423,7 @@ void rdp_set_texture_image(struct rdp_state* wstate, const uint32_t* args);
 void rdp_set_mask_image(struct rdp_state* wstate, const uint32_t* args);
 void rdp_set_color_image(struct rdp_state* wstate, const uint32_t* args);
 void rdp_cmd(struct rdp_state* wstate, const uint32_t* args);
+void rdp_idle(struct rdp_state* wstate);
 
 static const struct
 {
@@ -687,7 +707,30 @@ void rdp_set_other_modes(struct rdp_state* wstate, const uint32_t* args)
 void rdp_cmd(struct rdp_state* wstate, const uint32_t* args)
 {
     uint32_t cmd_id = CMD_ID(args);
+
+    if (wstate->lq_count) {
+        if (load_queue_cmd_flushes(cmd_id)) {
+            // syncs, drawing and loads complete all queued TMEM writes first
+            load_queue_flush(wstate);
+        } else {
+            // any other command retires one queued slot, after its own state change
+            rdp_commands[cmd_id].handler(wstate, args);
+            if (cmd_id == CMD_ID_SET_TEXTURE_IMAGE) {
+                load_queue_set_texture_image(wstate);
+            }
+            load_queue_retire(wstate);
+            return;
+        }
+    }
+
     rdp_commands[cmd_id].handler(wstate, args);
+}
+
+// the RDP ran out of commands: real hardware completes the queued TMEM writes
+// about 30 us later
+void rdp_idle(struct rdp_state* wstate)
+{
+    load_queue_flush(wstate);
 }
 
 #endif // N64VIDEO_C

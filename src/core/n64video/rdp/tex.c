@@ -484,23 +484,27 @@ static STRICTINLINE void texture_pipeline_cycle(struct rdp_state* wstate, struct
 
 }
 
-static void loading_pipeline(struct rdp_state* wstate, int start, int end, int tilenum, int coord_quad, int ltlut)
+/*
+ * Load queue (measured on NTSC and PAL consoles with rdp_load_hazard v1-v5):
+ *  - One slot is one iteration of the loading pipeline (8 source bytes; one
+ *    entry for Load_TLUT). Each row of a load takes max(words + 1, 9) slots;
+ *    the slots before its words write nothing.
+ *  - The last LOAD_QUEUE_DEPTH slots of a load are still pending when the next
+ *    command arrives. Every command that only sets state retires one slot,
+ *    after its own state change, so the write uses the tile descriptor of
+ *    that moment. Syncs, drawing commands and loads complete the whole queue
+ *    first. So does an idle RDP (about 30 us after it runs out of commands).
+ *  - Set_Texture_Image moves row r to the new address if it arrives while at
+ *    most lq_row_latch[r] slots have been retired. The latch slot depends on
+ *    the RDRAM alignment of the previous row (load_queue_latch_adj).
+ */
+#define LOAD_ROW_MIN_SLOTS 9
+
+static void load_qword(struct rdp_state* wstate, int tilenum, int coord_quad, int ltlut,
+                       int32_t s, int32_t t, int tiptr)
 {
-
-
-    //int localdebugmode = 0, cnt = 0;
-    int i, j;
-
-    int dsinc, dtinc;
-    dsinc = wstate->spans_ds;
-    dtinc = wstate->spans_dt;
-
-    int s, t;
     int ss, st;
-    int xstart, xend, xendsc;
     int sss = 0, sst = 0;
-    int ti_index, length;
-
     uint32_t tmemidx0 = 0, tmemidx1 = 0, tmemidx2 = 0, tmemidx3 = 0;
     int dswap = 0;
     uint32_t readval0, readval1, readval2, readval3;
@@ -510,18 +514,242 @@ static void loading_pipeline(struct rdp_state* wstate, int start, int end, int t
     int tmem_formatting = 0;
     uint32_t bit3fl = 0, hibit = 0;
 
-    if (end > start && ltlut)
-    {
-        rdp_pipeline_crashed = 1;
-        return;
-    }
-
     if (wstate->tile[tilenum].format == FORMAT_YUV)
         tmem_formatting = 0;
     else if (wstate->tile[tilenum].format == FORMAT_RGBA && wstate->tile[tilenum].size == PIXEL_SIZE_32BIT)
         tmem_formatting = 1;
     else
         tmem_formatting = 2;
+
+    ss = s >> 16;
+    st = t >> 16;
+
+    sss = ss & 0xffff;
+    sst = st & 0xffff;
+
+    tc_pipeline_load(&wstate->tile[tilenum], &sss, &sst, coord_quad);
+
+    dswap = sst & 1;
+
+
+    get_tmem_idx(wstate, sss, sst, tilenum, &tmemidx0, &tmemidx1, &tmemidx2, &tmemidx3, &bit3fl, &hibit);
+
+    readidx32 = (tiptr >> 2) & ~1;
+    RREADIDX32(readval0, readidx32);
+    readidx32++;
+    RREADIDX32(readval1, readidx32);
+    readidx32++;
+    RREADIDX32(readval2, readidx32);
+    readidx32++;
+    RREADIDX32(readval3, readidx32);
+
+
+    switch(tiptr & 7)
+    {
+    case 0:
+        if (!ltlut)
+            loadqword = ((uint64_t)readval0 << 32) | readval1;
+        else
+        {
+            tempshort = readval0 >> 16;
+            loadqword = ((uint64_t)tempshort << 48) | ((uint64_t) tempshort << 32) | ((uint64_t) tempshort << 16) | tempshort;
+        }
+        break;
+    case 1:
+        loadqword = ((uint64_t)readval0 << 40) | ((uint64_t)readval1 << 8) | (readval2 >> 24);
+        break;
+    case 2:
+        if (!ltlut)
+            loadqword = ((uint64_t)readval0 << 48) | ((uint64_t)readval1 << 16) | (readval2 >> 16);
+        else
+        {
+            tempshort = readval0 & 0xffff;
+            loadqword = ((uint64_t)tempshort << 48) | ((uint64_t) tempshort << 32) | ((uint64_t) tempshort << 16) | tempshort;
+        }
+        break;
+    case 3:
+        loadqword = ((uint64_t)readval0 << 56) | ((uint64_t)readval1 << 24) | (readval2 >> 8);
+        break;
+    case 4:
+        if (!ltlut)
+            loadqword = ((uint64_t)readval1 << 32) | readval2;
+        else
+        {
+            tempshort = readval1 >> 16;
+            loadqword = ((uint64_t)tempshort << 48) | ((uint64_t) tempshort << 32) | ((uint64_t) tempshort << 16) | tempshort;
+        }
+        break;
+    case 5:
+        loadqword = ((uint64_t)readval1 << 40) | ((uint64_t)readval2 << 8) | (readval3 >> 24);
+        break;
+    case 6:
+        if (!ltlut)
+            loadqword = ((uint64_t)readval1 << 48) | ((uint64_t)readval2 << 16) | (readval3 >> 16);
+        else
+        {
+            tempshort = readval1 & 0xffff;
+            loadqword = ((uint64_t)tempshort << 48) | ((uint64_t) tempshort << 32) | ((uint64_t) tempshort << 16) | tempshort;
+        }
+        break;
+    case 7:
+        loadqword = ((uint64_t)readval1 << 56) | ((uint64_t)readval2 << 24) | (readval3 >> 8);
+        break;
+    }
+
+
+    switch(tmem_formatting)
+    {
+    case 0:
+        readval0 = (uint32_t)((((loadqword >> 56) & 0xff) << 24) | (((loadqword >> 40) & 0xff) << 16) | (((loadqword >> 24) & 0xff) << 8) | (((loadqword >> 8) & 0xff) << 0));
+        readval1 = (uint32_t)((((loadqword >> 48) & 0xff) << 24) | (((loadqword >> 32) & 0xff) << 16) | (((loadqword >> 16) & 0xff) << 8) | (((loadqword >> 0) & 0xff) << 0));
+        if (bit3fl)
+        {
+            tmem16[tmemidx2 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 >> 16);
+            tmem16[tmemidx3 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 & 0xffff);
+            tmem16[(tmemidx2 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 >> 16);
+            tmem16[(tmemidx3 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 & 0xffff);
+        }
+        else
+        {
+            tmem16[tmemidx0 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 >> 16);
+            tmem16[tmemidx1 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 & 0xffff);
+            tmem16[(tmemidx0 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 >> 16);
+            tmem16[(tmemidx1 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 & 0xffff);
+        }
+        break;
+    case 1:
+        readval0 = (uint32_t)(((loadqword >> 48) << 16) | ((loadqword >> 16) & 0xffff));
+        readval1 = (uint32_t)((((loadqword >> 32) & 0xffff) << 16) | (loadqword & 0xffff));
+
+        if (bit3fl)
+        {
+            tmem16[tmemidx2 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 >> 16);
+            tmem16[tmemidx3 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 & 0xffff);
+            tmem16[(tmemidx2 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 >> 16);
+            tmem16[(tmemidx3 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 & 0xffff);
+        }
+        else
+        {
+            tmem16[tmemidx0 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 >> 16);
+            tmem16[tmemidx1 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 & 0xffff);
+            tmem16[(tmemidx0 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 >> 16);
+            tmem16[(tmemidx1 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 & 0xffff);
+        }
+        break;
+    case 2:
+        if (!dswap)
+        {
+            if (!hibit)
+            {
+                tmem16[tmemidx0 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 48);
+                tmem16[tmemidx1 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 32);
+                tmem16[tmemidx2 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 16);
+                tmem16[tmemidx3 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword & 0xffff);
+            }
+            else
+            {
+                tmem16[(tmemidx0 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 48);
+                tmem16[(tmemidx1 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 32);
+                tmem16[(tmemidx2 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 16);
+                tmem16[(tmemidx3 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword & 0xffff);
+            }
+        }
+        else
+        {
+            if (!hibit)
+            {
+                tmem16[tmemidx0 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 16);
+                tmem16[tmemidx1 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword & 0xffff);
+                tmem16[tmemidx2 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 48);
+                tmem16[tmemidx3 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 32);
+            }
+            else
+            {
+                tmem16[(tmemidx0 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 16);
+                tmem16[(tmemidx1 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword & 0xffff);
+                tmem16[(tmemidx2 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 48);
+                tmem16[(tmemidx3 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 32);
+            }
+        }
+    break;
+    }
+}
+
+// slot at which the source address of a row is fixed, relative to 4 slots
+// before its first TMEM write; w = words per row, j = 8-byte word index of
+// the previous row's start within its 64-byte RDRAM block
+static int load_queue_latch_adj(int w, int j)
+{
+    if (w <= 8) {
+        if (j + w > 8)
+            return (8 - j < 4) ? 8 - j : 4;
+        return ((j & 1) && w >= 2) ? -1 : 0;
+    } else {
+        int t = (j + w) & 7;
+        if (!t)
+            return 0;
+        return (8 - t < 4) ? 8 - t : 4;
+    }
+}
+
+static void load_queue_retire(struct rdp_state* wstate)
+{
+    if (!wstate->lq_count)
+        return;
+
+    int k = wstate->lq_head++;
+    int row = wstate->lq_slot[k].row;
+    if (row >= 0) {
+        load_qword(wstate, wstate->lq_tilenum, wstate->lq_coord_quad, wstate->lq_ltlut,
+                   wstate->lq_slot[k].s, wstate->lq_slot[k].t,
+                   (int)(wstate->lq_row_base[row] + wstate->lq_slot[k].offset));
+    }
+
+    if (wstate->lq_head >= wstate->lq_count)
+        wstate->lq_count = wstate->lq_head = wstate->lq_rows = 0;
+}
+
+static void load_queue_flush(struct rdp_state* wstate)
+{
+    while (wstate->lq_count)
+        load_queue_retire(wstate);
+}
+
+static void load_queue_set_texture_image(struct rdp_state* wstate)
+{
+    for (int r = 0; r < wstate->lq_rows; r++)
+        if (wstate->lq_row_latch[r] >= wstate->lq_head)
+            wstate->lq_row_base[r] = wstate->ti_address;
+}
+
+static int load_queue_cmd_flushes(uint32_t cmd_id)
+{
+    return (cmd_id >= CMD_ID_FILL_TRIANGLE && cmd_id <= CMD_ID_SHADE_TEXTURE_Z_BUFFER_TRIANGLE)
+        || (cmd_id >= CMD_ID_TEXTURE_RECTANGLE && cmd_id <= CMD_ID_SYNC_FULL)
+        || cmd_id == CMD_ID_LOAD_TLUT || cmd_id == CMD_ID_LOAD_BLOCK || cmd_id == CMD_ID_LOAD_TILE
+        || cmd_id == CMD_ID_FILL_RECTANGLE;
+}
+
+static void loading_pipeline(struct rdp_state* wstate, int start, int end, int tilenum, int coord_quad, int ltlut)
+{
+    int i, j, b;
+
+    int dsinc, dtinc;
+    dsinc = wstate->spans_ds;
+    dtinc = wstate->spans_dt;
+
+    int s, t;
+    int xstart, xend;
+    int ti_index, length;
+
+    // a new load always starts with an empty queue
+    load_queue_flush(wstate);
+
+    if (end > start && ltlut)
+    {
+        rdp_pipeline_crashed = 1;
+        return;
+    }
 
     int tiadvance = 0, spanadvance = 0;
     int tiptr = 0;
@@ -553,11 +781,29 @@ static void loading_pipeline(struct rdp_state* wstate, int start, int end, int t
         break;
     }
 
+    // slot layout: find where the queued tail starts
+    int total_slots = 0;
+    for (i = start; i <= end; i++)
+    {
+        length = (wstate->span[i].lx - wstate->span[i].unscrx + 1) & 0xfff;
+        int words = (length + spanadvance - 1) / spanadvance;
+        if (words)
+            total_slots += (words + 1 > LOAD_ROW_MIN_SLOTS) ? words + 1 : LOAD_ROW_MIN_SLOTS;
+    }
+    int first_queued = total_slots > LOAD_QUEUE_DEPTH ? total_slots - LOAD_QUEUE_DEPTH : 0;
+
+    wstate->lq_tilenum = tilenum;
+    wstate->lq_coord_quad = coord_quad;
+    wstate->lq_ltlut = ltlut;
+
+    int slot = 0;
+    int have_prev = 0;
+    uint32_t prev_row_addr = 0;
+
     for (i = start; i <= end; i++)
     {
         xstart = wstate->span[i].lx;
         xend = wstate->span[i].unscrx;
-        xendsc = wstate->span[i].rx;
         s = wstate->span[i].s;
         t = wstate->span[i].t;
 
@@ -565,168 +811,47 @@ static void loading_pipeline(struct rdp_state* wstate, int start, int end, int t
         tiptr = wstate->ti_address + PIXELS_TO_BYTES(ti_index, wstate->ti_size);
 
         length = (xstart - xend + 1) & 0xfff;
+        int words = (length + spanadvance - 1) / spanadvance;
+        if (!words)
+            continue;
 
-        for (j = 0; j < length; j+= spanadvance)
+        int row_slots = (words + 1 > LOAD_ROW_MIN_SLOTS) ? words + 1 : LOAD_ROW_MIN_SLOTS;
+        for (b = 0; b < row_slots - words; b++, slot++)
         {
-            ss = s >> 16;
-            st = t >> 16;
-
-
-
-
-
-
-
-            sss = ss & 0xffff;
-            sst = st & 0xffff;
-
-            tc_pipeline_load(&wstate->tile[tilenum], &sss, &sst, coord_quad);
-
-            dswap = sst & 1;
-
-
-            get_tmem_idx(wstate, sss, sst, tilenum, &tmemidx0, &tmemidx1, &tmemidx2, &tmemidx3, &bit3fl, &hibit);
-
-            readidx32 = (tiptr >> 2) & ~1;
-            RREADIDX32(readval0, readidx32);
-            readidx32++;
-            RREADIDX32(readval1, readidx32);
-            readidx32++;
-            RREADIDX32(readval2, readidx32);
-            readidx32++;
-            RREADIDX32(readval3, readidx32);
-
-
-            switch(tiptr & 7)
+            if (slot >= first_queued)
             {
-            case 0:
-                if (!ltlut)
-                    loadqword = ((uint64_t)readval0 << 32) | readval1;
-                else
-                {
-                    tempshort = readval0 >> 16;
-                    loadqword = ((uint64_t)tempshort << 48) | ((uint64_t) tempshort << 32) | ((uint64_t) tempshort << 16) | tempshort;
-                }
-                break;
-            case 1:
-                loadqword = ((uint64_t)readval0 << 40) | ((uint64_t)readval1 << 8) | (readval2 >> 24);
-                break;
-            case 2:
-                if (!ltlut)
-                    loadqword = ((uint64_t)readval0 << 48) | ((uint64_t)readval1 << 16) | (readval2 >> 16);
-                else
-                {
-                    tempshort = readval0 & 0xffff;
-                    loadqword = ((uint64_t)tempshort << 48) | ((uint64_t) tempshort << 32) | ((uint64_t) tempshort << 16) | tempshort;
-                }
-                break;
-            case 3:
-                loadqword = ((uint64_t)readval0 << 56) | ((uint64_t)readval1 << 24) | (readval2 >> 8);
-                break;
-            case 4:
-                if (!ltlut)
-                    loadqword = ((uint64_t)readval1 << 32) | readval2;
-                else
-                {
-                    tempshort = readval1 >> 16;
-                    loadqword = ((uint64_t)tempshort << 48) | ((uint64_t) tempshort << 32) | ((uint64_t) tempshort << 16) | tempshort;
-                }
-                break;
-            case 5:
-                loadqword = ((uint64_t)readval1 << 40) | ((uint64_t)readval2 << 8) | (readval3 >> 24);
-                break;
-            case 6:
-                if (!ltlut)
-                    loadqword = ((uint64_t)readval1 << 48) | ((uint64_t)readval2 << 16) | (readval3 >> 16);
-                else
-                {
-                    tempshort = readval1 & 0xffff;
-                    loadqword = ((uint64_t)tempshort << 48) | ((uint64_t) tempshort << 32) | ((uint64_t) tempshort << 16) | tempshort;
-                }
-                break;
-            case 7:
-                loadqword = ((uint64_t)readval1 << 56) | ((uint64_t)readval2 << 24) | (readval3 >> 8);
-                break;
+                wstate->lq_slot[wstate->lq_count].row = -1;
+                wstate->lq_count++;
             }
+        }
 
+        int qrow = -1;
+        if (slot + words > first_queued)
+        {
+            qrow = wstate->lq_rows++;
+            wstate->lq_row_base[qrow] = wstate->ti_address;
+            wstate->lq_row_latch[qrow] = have_prev
+                ? slot - first_queued - 4 + load_queue_latch_adj(words, (prev_row_addr >> 3) & 7)
+                : -1;
+        }
 
-            switch(tmem_formatting)
+        prev_row_addr = (uint32_t)tiptr;
+        have_prev = 1;
+
+        for (j = 0; j < length; j += spanadvance, slot++)
+        {
+            if (slot < first_queued)
             {
-            case 0:
-                readval0 = (uint32_t)((((loadqword >> 56) & 0xff) << 24) | (((loadqword >> 40) & 0xff) << 16) | (((loadqword >> 24) & 0xff) << 8) | (((loadqword >> 8) & 0xff) << 0));
-                readval1 = (uint32_t)((((loadqword >> 48) & 0xff) << 24) | (((loadqword >> 32) & 0xff) << 16) | (((loadqword >> 16) & 0xff) << 8) | (((loadqword >> 0) & 0xff) << 0));
-                if (bit3fl)
-                {
-                    tmem16[tmemidx2 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 >> 16);
-                    tmem16[tmemidx3 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 & 0xffff);
-                    tmem16[(tmemidx2 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 >> 16);
-                    tmem16[(tmemidx3 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 & 0xffff);
-                }
-                else
-                {
-                    tmem16[tmemidx0 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 >> 16);
-                    tmem16[tmemidx1 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 & 0xffff);
-                    tmem16[(tmemidx0 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 >> 16);
-                    tmem16[(tmemidx1 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 & 0xffff);
-                }
-                break;
-            case 1:
-                readval0 = (uint32_t)(((loadqword >> 48) << 16) | ((loadqword >> 16) & 0xffff));
-                readval1 = (uint32_t)((((loadqword >> 32) & 0xffff) << 16) | (loadqword & 0xffff));
-
-                if (bit3fl)
-                {
-                    tmem16[tmemidx2 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 >> 16);
-                    tmem16[tmemidx3 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 & 0xffff);
-                    tmem16[(tmemidx2 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 >> 16);
-                    tmem16[(tmemidx3 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 & 0xffff);
-                }
-                else
-                {
-                    tmem16[tmemidx0 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 >> 16);
-                    tmem16[tmemidx1 ^ WORD_ADDR_XOR] = (uint16_t)(readval0 & 0xffff);
-                    tmem16[(tmemidx0 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 >> 16);
-                    tmem16[(tmemidx1 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(readval1 & 0xffff);
-                }
-                break;
-            case 2:
-                if (!dswap)
-                {
-                    if (!hibit)
-                    {
-                        tmem16[tmemidx0 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 48);
-                        tmem16[tmemidx1 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 32);
-                        tmem16[tmemidx2 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 16);
-                        tmem16[tmemidx3 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword & 0xffff);
-                    }
-                    else
-                    {
-                        tmem16[(tmemidx0 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 48);
-                        tmem16[(tmemidx1 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 32);
-                        tmem16[(tmemidx2 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 16);
-                        tmem16[(tmemidx3 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword & 0xffff);
-                    }
-                }
-                else
-                {
-                    if (!hibit)
-                    {
-                        tmem16[tmemidx0 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 16);
-                        tmem16[tmemidx1 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword & 0xffff);
-                        tmem16[tmemidx2 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 48);
-                        tmem16[tmemidx3 ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 32);
-                    }
-                    else
-                    {
-                        tmem16[(tmemidx0 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 16);
-                        tmem16[(tmemidx1 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword & 0xffff);
-                        tmem16[(tmemidx2 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 48);
-                        tmem16[(tmemidx3 | 0x400) ^ WORD_ADDR_XOR] = (uint16_t)(loadqword >> 32);
-                    }
-                }
-            break;
+                load_qword(wstate, tilenum, coord_quad, ltlut, s, t, tiptr);
             }
-
+            else
+            {
+                int k = wstate->lq_count++;
+                wstate->lq_slot[k].s = s;
+                wstate->lq_slot[k].t = t;
+                wstate->lq_slot[k].offset = (uint32_t)tiptr - wstate->ti_address;
+                wstate->lq_slot[k].row = (int8_t)qrow;
+            }
 
             s = (s + dsinc) & ~0x1f;
             t = (t + dtinc) & ~0x1f;
